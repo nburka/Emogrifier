@@ -2,20 +2,21 @@
 
 /**
  * The MIT License (MIT)
- * 
+ *
  * Copyright (c) 2008-2013 pelago
  * Copyright (c) 2013 silverorange
- * 
+ * Copyright (c) 2013 Martijn W. van der Lee
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
  * in the Software without restriction, including without limitation the rights
  * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
  * copies of the Software, and to permit persons to whom the Software is
  * furnished to do so, subject to the following conditions:
- * 
+ *
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -30,6 +31,10 @@ class Emogrifier
         CACHE_CSS = 0,
         CACHE_SELECTOR = 1,
         CACHE_XPATH = 2,
+
+        // output modes
+        FILTER_DOCUMENT = 0,
+        FILTER_BODY = 1,
 
         // for calculating nth-of-type and nth-child selectors
         INDEX = 0,
@@ -56,6 +61,18 @@ class Emogrifier
      */
     public $overwriteDuplicateStyles = true;
 
+    /**
+     * Delete invisible nodes
+     * @var bool
+     */
+    public $shouldKeepInvisibleNodes  = true;
+    
+    /**
+     * Customize how output is filtered.
+     * @var int
+     */
+    public $filterOutput = self::FILTER_DOCUMENT;
+
     public function __construct($html = '', $css = '')
     {
         $this->html = $html;
@@ -67,7 +84,7 @@ class Emogrifier
     public function setCSS($css = '')
     {
         $this->css = $css;
-        $this->clearCache(static::CACHE_CSS);
+        $this->clearCache(self::CACHE_CSS);
     }
 
     public function clearCache($key = null)
@@ -78,9 +95,9 @@ class Emogrifier
             }
         } else {
             $this->caches = array(
-                static::CACHE_CSS       => array(),
-                static::CACHE_SELECTOR  => array(),
-                static::CACHE_XPATH     => array(),
+                self::CACHE_CSS       => array(),
+                self::CACHE_SELECTOR  => array(),
+                self::CACHE_XPATH     => array(),
             );
         }
     }
@@ -115,6 +132,14 @@ class Emogrifier
 			array($selector));
     }
 
+	private static function innerHTML($node){
+		$doc = new DOMDocument();
+		foreach ($node->childNodes as $child) {
+			$doc->appendChild($doc->importNode($child, true));
+		}
+		return $doc->saveHTML();
+	}
+
     // applies the CSS you submit to the html you submit. places the css inline
     public function emogrify()
     {
@@ -126,6 +151,11 @@ class Emogrifier
             $body = preg_replace("/<\/?($unprocessableHTMLTags)[^>]*>/i",'',$body);
         }
 
+		// if no body, wrap in a body to prevent introducing paragraph tag
+		if (preg_match('/<body\W/', $body) === 0) {
+			$body = '<body>'.$body.'</body>';
+		}
+
         $encoding = mb_detect_encoding($body);
         $body = mb_convert_encoding($body, 'HTML-ENTITIES', $encoding);
 
@@ -133,28 +163,11 @@ class Emogrifier
         $xmldoc->encoding = $encoding;
         $xmldoc->strictErrorChecking = false;
         $xmldoc->formatOutput = true;
+		libxml_use_internal_errors(true);
         $xmldoc->loadHTML($body);
         $xmldoc->normalizeDocument();
 
         $xpath = new DOMXPath($xmldoc);
-
-        // before be begin processing the CSS file, parse the document and normalize all existing CSS attributes (changes 'DISPLAY: none' to 'display: none');
-        // we wouldn't have to do this if DOMXPath supported XPath 2.0.
-        // also store a reference of nodes with existing inline styles so we don't overwrite them
-        $vistedNodes = $vistedNodeRef = array();
-        $nodes = @$xpath->query('//*[@style]');
-        foreach ($nodes as $node) {
-            $normalizedOrigStyle = preg_replace('/[A-z\-]+(?=\:)/Se',"strtolower('\\0')", $node->getAttribute('style'));
-
-            // in order to not overwrite existing style attributes in the HTML, we have to save the original HTML styles
-            $nodeKey = md5($node->getNodePath());
-            if (!isset($vistedNodeRef[$nodeKey])) {
-                $vistedNodeRef[$nodeKey] = $this->cssStyleDefinitionToArray($normalizedOrigStyle);
-                $vistedNodes[$nodeKey]   = $node;
-            }
-
-            $node->setAttribute('style', $normalizedOrigStyle);
-        }
 
         // grab any existing style blocks from the html and append them to the existing CSS
         // (these blocks should be appended so as to have precedence over conflicting styles in the existing CSS)
@@ -191,7 +204,7 @@ class Emogrifier
         $css = preg_replace($regexp, '', $css);
 
         $csskey = md5($css);
-        if (!isset($this->caches[static::CACHE_CSS][$csskey])) {
+        if (!isset($this->caches[self::CACHE_CSS][$csskey])) {
 
             // process the CSS file for selectors and definitions
             preg_match_all('/(^|[^{}])\s*([^{]+){([^}]*)}/mis', $css, $matches, PREG_SET_ORDER);
@@ -223,7 +236,7 @@ class Emogrifier
             // now sort the selectors by precedence
             usort($all_selectors, array($this,'sortBySelectorPrecedence'));
 
-            $this->caches[static::CACHE_CSS][$csskey] = $all_selectors;
+            $this->caches[self::CACHE_CSS][$csskey] = $all_selectors;
         }
 
         // Prepare the list of excluded nodes for this HTML
@@ -236,10 +249,11 @@ class Emogrifier
             }
         }
 
-        foreach ($this->caches[static::CACHE_CSS][$csskey] as $value) {
+        foreach ($this->caches[self::CACHE_CSS][$csskey] as $value) {
+			$newStyleArr = $this->cssStyleDefinitionToArray($value['attributes']);
 
             // query the body for the xpath selector
-            $nodes = $xpath->query($this->translateCSStoXpath(trim($value['selector'])));
+            $nodes = $xpath->query($this->translateCSStoXpath($value['selector']));
 
             foreach ($nodes as $node) {
                 // Exclude any nodes selected through the $excludeNodes attribute
@@ -252,14 +266,14 @@ class Emogrifier
                 // if it has a style attribute, get it, process it, and append (overwrite) new stuff
                 if ($node->hasAttribute('style')) {
                     // break it up into an associative array
+		            $oldStyle = preg_replace('/[A-z\-]+(?=\:)/Se',"strtolower('\\0')", $node->getAttribute('style'));
                     $oldStyleArr = $this->cssStyleDefinitionToArray($node->getAttribute('style'));
-                    $newStyleArr = $this->cssStyleDefinitionToArray($value['attributes']);
 
                     // New styles overwrite the old styles by default (not technically accurate, but close enough)
                     // Set the $overwriteDuplicateStyles to false to keep old styles if present.
                     $combinedArr = $this->overwriteDuplicateStyles
-                                 ? array_merge($oldStyleArr,$newStyleArr)
-                                 : array_merge($newStyleArr,$oldStyleArr);
+                                 ? $newStyleArr + $oldStyleArr
+                                 : $oldStyleArr + $newStyleArr;
 
                     $style = '';
                     foreach ($combinedArr as $k => $v) {
@@ -267,40 +281,28 @@ class Emogrifier
                     }
                 } else {
                     // otherwise create a new style
-                    $style = trim($value['attributes']);
+                    $style = $value['attributes'];
                 }
                 $node->setAttribute('style', $style);
             }
         }
 
-        // now iterate through the nodes that contained inline styles in the original HTML
-        foreach ($vistedNodeRef as $nodeKey => $origStyleArr) {
-            $node = $vistedNodes[$nodeKey];
-            $currStyleArr = $this->cssStyleDefinitionToArray($node->getAttribute('style'));
-
-            $combinedArr = array_merge($currStyleArr, $origStyleArr);
-            $style = '';
-            foreach ($combinedArr as $k => $v) {
-                $style .= (strtolower($k) . ':' . $v . ';');
-            }
-
-            $node->setAttribute('style', $style);
-        }
-
-        // This removes styles from your email that contain display:none.
-        // We need to look for display:none, but we need to do a case-insensitive search. Since DOMDocument only supports XPath 1.0,
-        // lower-case() isn't available to us. We've thus far only set attributes to lowercase, not attribute values. Consequently, we need
-        // to translate() the letters that would be in 'NONE' ("NOE") to lowercase.
-        $nodes = $xpath->query('//*[contains(translate(translate(@style," ",""),"NOE","noe"),"display:none")]');
-
-        // The checks on parentNode and is_callable below ensure that if we've deleted the parent node,
-        // we don't try to call removeChild on a nonexistent child node
-        if ($nodes->length > 0) {
-            foreach ($nodes as $node) {
-                if ($node->parentNode && is_callable(array($node->parentNode,'removeChild'))) {
-                    $node->parentNode->removeChild($node);
-                }
-            }
+        if (!$this->shouldKeepInvisibleNodes) {
+	        // This removes styles from your email that contain display:none.
+	        // We need to look for display:none, but we need to do a case-insensitive search. Since DOMDocument only supports XPath 1.0,
+	        // lower-case() isn't available to us. We've thus far only set attributes to lowercase, not attribute values. Consequently, we need
+	        // to translate() the letters that would be in 'NONE' ("NOE") to lowercase.
+	        $nodes = $xpath->query('//*[contains(translate(translate(@style," ",""),"NOE","noe"),"display:none")]');
+	
+	        // The checks on parentNode and is_callable below ensure that if we've deleted the parent node,
+	        // we don't try to call removeChild on a nonexistent child node
+	        if ($nodes->length > 0) {
+	            foreach ($nodes as $node) {
+	                if ($node->parentNode && is_callable(array($node->parentNode,'removeChild'))) {
+	                    $node->parentNode->removeChild($node);
+	                }
+	            }
+	        }
         }
 
         // add back in preserved media query styles
@@ -314,11 +316,13 @@ class Emogrifier
             }
         }
 
-        if ($this->preserveEncoding) {
-            return mb_convert_encoding($xmldoc->saveHTML(), $encoding, 'HTML-ENTITIES');
-        } else {
-            return $xmldoc->saveHTML();
-        }
+		$output = $this->filterOutput === self::FILTER_BODY
+				? self::innerHTML($xmldoc->documentElement->firstChild)
+				: $xmldoc->saveHTML();
+
+		return $this->preserveEncoding
+				? mb_convert_encoding($output, $encoding, 'HTML-ENTITIES')
+				: $output;
     }
 
     protected function sortBySelectorPrecedence($a, $b)
@@ -334,7 +338,7 @@ class Emogrifier
     protected function getCSSSelectorPrecedence($selector)
     {
         $selectorkey = md5($selector);
-        if (!isset($this->caches[static::CACHE_SELECTOR][$selectorkey])) {
+        if (!isset($this->caches[self::CACHE_SELECTOR][$selectorkey])) {
             $precedence = 0;
             $value = 100;
             $search = array('\#','\.',''); // ids: worth 100, classes: worth 10, elements: worth 1
@@ -348,10 +352,10 @@ class Emogrifier
                 $precedence += ($value * $num);
                 $value /= 10;
             }
-            $this->caches[static::CACHE_SELECTOR][$selectorkey] = $precedence;
+            $this->caches[self::CACHE_SELECTOR][$selectorkey] = $precedence;
         }
 
-        return $this->caches[static::CACHE_SELECTOR][$selectorkey];
+        return $this->caches[self::CACHE_SELECTOR][$selectorkey];
     }
 
     // right now we support all CSS 1 selectors and most CSS2/3 selectors.
@@ -360,7 +364,7 @@ class Emogrifier
     {
         $css_selector = trim($css_selector);
         $xpathkey = md5($css_selector);
-        if (!isset($this->caches[static::CACHE_XPATH][$xpathkey])) {
+        if (!isset($this->caches[self::CACHE_XPATH][$xpathkey])) {
             // returns an Xpath selector
             $search = array(
                '/\s+>\s+/', // Matches any element that is a child of parent.
@@ -393,10 +397,10 @@ class Emogrifier
             $css_selector = preg_replace_callback('/([^\/]+):nth-child\(\s*(odd|even|[+\-]?\d|[+\-]?\d?n(\s*[+\-]\s*\d)?)\s*\)/i', array($this, 'translateNthChild'), $css_selector);
             $css_selector = preg_replace_callback('/([^\/]+):nth-of-type\(\s*(odd|even|[+\-]?\d|[+\-]?\d?n(\s*[+\-]\s*\d)?)\s*\)/i', array($this, 'translateNthOfType'), $css_selector);
 
-            $this->caches[static::CACHE_SELECTOR][$xpathkey] = $css_selector;
+            $this->caches[self::CACHE_SELECTOR][$xpathkey] = $css_selector;
         }
 
-        return $this->caches[static::CACHE_SELECTOR][$xpathkey];
+        return $this->caches[self::CACHE_SELECTOR][$xpathkey];
     }
 
     protected function translateNthChild($match)
@@ -474,17 +478,18 @@ class Emogrifier
 
     protected function cssStyleDefinitionToArray($style)
     {
-        $definitions = explode(';',$style);
         $retArr = array();
-        foreach ($definitions as $def) {
-            if (empty($def) || strpos($def, ':') === false) {
-                continue;
-            }
-            list($key,$value) = explode(':',$def,2);
-            if (empty($key) || strlen(trim($value)) === 0) {
-                continue;
-            }
-            $retArr[trim($key)] = trim($value);
+		foreach (explode(';', $style) as $def) {
+            $list = explode(':', $def, 2);
+			if (count($list) >= 2) {
+				list($key, $value) = $list;
+				if (!empty($key)) {
+					$value = trim($value);
+					if (isset($value{0})) {
+						$retArr[trim($key)] = $value;
+					}
+				}
+			}
         }
 
         return $retArr;
